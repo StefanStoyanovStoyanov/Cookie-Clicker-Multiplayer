@@ -20,7 +20,10 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, broadcast};
+use tokio::{
+    sync::{Mutex, broadcast},
+    time::{self, MissedTickBehavior},
+};
 use tower_http::services::ServeDir;
 
 #[derive(Clone)]
@@ -87,8 +90,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         return;
     }
 
+    let mut heartbeat = time::interval(std::time::Duration::from_secs(25));
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    heartbeat.tick().await;
+
     loop {
         tokio::select! {
+            _ = heartbeat.tick() => {
+                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
             incoming = receiver.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
@@ -112,7 +124,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(_)) => {}
+                    Some(Ok(Message::Pong(_))) | Some(Ok(_)) => {}
                     Some(Err(error)) => {
                         eprintln!("WebSocket connection error: {error}");
                         break;

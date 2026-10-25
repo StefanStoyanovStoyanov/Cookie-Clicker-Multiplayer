@@ -43,12 +43,14 @@
 
         <script>
             const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-            const socket = new WebSocket(`${protocol}//${location.host}/ws`);
             const cookie = document.getElementById("cookie");
             const counter = document.getElementById("counter");
             const canvas = document.createElement("canvas");
             const context = canvas.getContext("2d", { willReadFrequently: true });
             let cookiePixels = null;
+            let socket;
+            let reconnectDelay = 1000;
+            let reconnectTimer;
 
             function readCookiePixels() {
                 if (!context) {
@@ -101,12 +103,32 @@
                 }
             });
 
-            socket.addEventListener("message", (message) => {
-                const data = JSON.parse(message.data);
-                if (data.event === "updateCount") {
-                    counter.textContent = `Total Clicks: ${data.count}`;
-                }
-            });
+            function connect() {
+                socket = new WebSocket(`${protocol}//${location.host}/ws`);
+
+                socket.addEventListener("open", () => {
+                    reconnectDelay = 1000;
+                });
+
+                socket.addEventListener("message", (message) => {
+                    const data = JSON.parse(message.data);
+                    if (data.event === "updateCount") {
+                        counter.textContent = `Total Clicks: ${data.count}`;
+                    }
+                });
+
+                socket.addEventListener("close", () => {
+                    clearTimeout(reconnectTimer);
+                    reconnectTimer = setTimeout(connect, reconnectDelay);
+                    reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+                });
+
+                socket.addEventListener("error", () => {
+                    socket.close();
+                });
+            }
+
+            connect();
         </script>
     </body>
 </html>
