@@ -14,18 +14,21 @@ use axum::{
         State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
+    http::StatusCode,
     response::IntoResponse,
     routing::get,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, broadcast};
 use tower_http::services::ServeDir;
 
 #[derive(Clone)]
 struct AppState {
     click_count: Arc<AtomicU64>,
     updates: broadcast::Sender<u64>,
+    count_file: PathBuf,
+    persistence_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Deserialize)]
@@ -44,21 +47,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = env::var("PORT")
         .unwrap_or_else(|_| "3000".to_owned())
         .parse::<u16>()?;
+    let static_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let count_file = static_dir.join("click-count.txt");
+    let click_count = load_click_count(&count_file).await?;
     let (updates, _) = broadcast::channel(100);
     let state = AppState {
-        click_count: Arc::new(AtomicU64::new(0)),
+        click_count: Arc::new(AtomicU64::new(click_count)),
         updates,
+        count_file,
+        persistence_lock: Arc::new(Mutex::new(())),
     };
-    let static_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
     let app = Router::new()
         .route("/ws", get(websocket_handler))
+        .route("/click-count.txt", get(|| async { StatusCode::NOT_FOUND }))
         .fallback_service(ServeDir::new(static_dir).append_index_html_on_directories(true))
         .with_state(state);
 
     let address = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(address).await?;
-    println!("Server running on port {port}");
+    println!("Server running on port {port}; loaded click count: {click_count}");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -89,6 +97,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 let count = state.click_count.fetch_add(1, Ordering::Relaxed) + 1;
                                 if state.updates.send(count).is_err() {
                                     eprintln!("Unable to broadcast updated click count: no active subscribers");
+                                }
+                                if let Err(error) = persist_click_count(&state).await {
+                                    eprintln!("Unable to save click count: {error}");
                                 }
                             }
                             Ok(_) => {}
@@ -126,6 +137,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             }
         }
     }
+}
+
+async fn load_click_count(path: &PathBuf) -> Result<u64, Box<dyn std::error::Error>> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(contents) => Ok(contents.trim().parse()?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn persist_click_count(state: &AppState) -> Result<(), std::io::Error> {
+    let _guard = state.persistence_lock.lock().await;
+    let count = state.click_count.load(Ordering::Relaxed);
+    tokio::fs::write(&state.count_file, count.to_string()).await
 }
 
 async fn send_count(
